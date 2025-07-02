@@ -1,87 +1,82 @@
 worker_processes auto;
 daemon off;
 
-<% if ENV["ENABLE_MODSECURITY"] %>
-load_module modules/ngx_http_modsecurity_module.so;
-<% end %>
-
 events {
-    worker_connections  1024;
+  worker_connections 1024;
 }
+
 http {
-    # Hide nginx version information.
-    server_tokens off;
+  include mime.types;
+  default_type application/octet-stream;
+  sendfile on;
+  root <%= ENV['HOME'] %>;
 
-    sendfile    on;
-    tcp_nopush  on;
-    tcp_nodelay off;
-
-    keepalive_timeout  65;
-
-    log_format specialLog '$http_x_forwarded_for - '
+  log_format specialLog '$http_x_forwarded_for - '
                       '"$request" $status $body_bytes_sent $request_time '
                       '"$http_referer" "$http_user_agent"';
 
-    error_log logs/error.log notice;
-    access_log logs/access.log specialLog;
+  error_log logs/error.log notice;
+  access_log logs/access.log specialLog;
 
-    client_max_body_size 100m;
-    client_body_timeout 600s;
+  map $http_referer $is_suspicious {
+    default 1;
+    "~^https?://localhost:9001/" 0;
+  }
 
-    upstream php {
-        server unix:/tmp/php-fpm.sock max_fails=3 fail_timeout=3s;
-        keepalive 16;
+  map $http_referer $is_blacklisted {
+    default 0;
+    "~^https?://localhost:9002/" 1;
+  }
+
+  log_format suspicious_json escape=json '{'
+    "\"logger_name\":\"DossierFacileCDNLogger\","
+    "\"@timestamp\":\"$time_iso8601\","
+    "\"alert_code\":\"CDN_SUSPICIOUS\","
+    "\"remote_addr\":\"$remote_addr\","
+    "\"request\":\"$request\","
+    "\"status\":\"$status\","
+    "\"referer\":\"$http_referer\","
+    "\"user_agent\":\"$http_user_agent\","
+    "\"uri\":\"$uri\","
+    "\"host\":\"$host\""
+  '}';
+
+  log_format blacklisted_json escape=json '{'
+    "\"logger_name\":\"DossierFacileCDNLogger\","
+    "\"@timestamp\":\"$time_iso8601\","
+    "\"alert_code\":\"CDN_BLACKLISTED\","
+    "\"remote_addr\":\"$remote_addr\","
+    "\"request\":\"$request\","
+    "\"status\":\"$status\","
+    "\"referer\":\"$http_referer\","
+    "\"user_agent\":\"$http_user_agent\","
+    "\"uri\":\"$uri\","
+    "\"host\":\"$host\""
+  '}';
+
+  access_log /dev/stdout suspicious_json if=$is_suspicious;
+  access_log /dev/stdout suspicious_json if=$is_blacklisted;
+  access_log syslog:server=57.128.108.14:515,tag=cdn_suspicious suspicious_json if=$is_suspicious;
+  access_log syslog:server=57.128.108.14:515,tag=cdn_blacklisted blacklisted_json if=$is_blacklisted;
+
+  server {
+    listen <%= ENV['PORT'] %>;
+    root /app/dist;
+
+    location / {
+      index index.html;
+      try_files $uri $uri.html $uri/index.html /index.html =404;
     }
 
-    index index.html index.htm index.xhtml;
-    include mime.types;
-    default_type application/octet-stream;
-
-    set_real_ip_from 0.0.0.0/0;
-    real_ip_header X-Forwarded-For;
-
-    root <%= ENV['HOME'] %>;
-
-    # Enable Gzip compression.
-    gzip on;
-    gzip_http_version 1.0;
-    gzip_comp_level 5;
-    gzip_min_length 256;
-    gzip_proxied any;
-    gzip_vary on;
-    gzip_types
-      application/atom+xml
-      application/javascript
-      application/x-javascript
-      application/json
-      application/rss+xml
-      application/vnd.ms-fontobject
-      application/x-font-ttf
-      application/x-web-app-manifest+json
-      application/xhtml+xml
-      application/xml
-      font/opentype
-      image/svg+xml
-      image/x-icon
-      text/css
-      text/plain
-      text/x-component;
-    # text/html is always compressed by HttpGzipModule
-
-    <% if ENV['ENABLE_MODSECURITY'] %>
-      modsecurity on;
-      modsecurity_rules_file "/app/vendor/nginx/conf/modsec-nginx.conf";
-    <% end %>
-
-    <% if ENV['HAS_SERVER_CONF'] %>
-      include servers.conf;
-    <% else %>
-    server {
-        server_name localhost;
-        listen <%= ENV['PORT'] %>;
-
-        charset utf-8;
-        include site.conf;
+    location /images/ {
+      if ($is_blacklisted) {
+        rewrite ^/images/(.*)$ /altered/$1 break;
+      }
+      try_files $uri =404;
     }
-    <% end %>
+
+    location /altered/ {
+      try_files /altered/$1 =404;
+    }
+  }
 }
